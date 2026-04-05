@@ -1,0 +1,80 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+    compatible = "brcm,bcm2712";
+
+    /* Enable the I2S clock consumer (Pi is slave, ReSpeaker Lite is master) */
+    fragment@0 {
+        target = <&i2s_clk_consumer>;
+        __overlay__ {
+            status = "okay";
+        };
+    };
+
+    /* Dummy codecs for raw I2S passthrough */
+    fragment@1 {
+        target-path = "/";
+        __overlay__ {
+            /* Capture direction: XMOS mic data -> Pi */
+            respeaker_cap: respeaker-capture-codec {
+                compatible = "linux,spdif-dir";
+                #sound-dai-cells = <0>;
+                status = "okay";
+            };
+
+            /* Playback direction: Pi -> XMOS -> speaker/headphone */
+            respeaker_play: respeaker-playback-codec {
+                compatible = "linux,spdif-dit";
+                #sound-dai-cells = <0>;
+                status = "okay";
+            };
+        };
+    };
+
+    /* Sound card with capture and playback on separate DAI links */
+    fragment@2 {
+        target = <&sound>;
+        __overlay__ {
+            compatible = "simple-audio-card";
+            status = "okay";
+            simple-audio-card,name = "ReSpeaker-Lite";
+
+            /* Link 0: Capture (XMOS mic -> Pi) = hw:X,0 */
+            simple-audio-card,dai-link@0 {
+                reg = <0>;
+                format = "i2s";
+                bitclock-master = <&link0_codec>;
+                frame-master = <&link0_codec>;
+
+                link0_cpu: cpu {
+                    sound-dai = <&i2s_clk_consumer>;
+                    dai-tdm-slot-num = <2>;
+                    dai-tdm-slot-width = <32>;
+                };
+
+                link0_codec: codec {
+                    sound-dai = <&respeaker_cap>;
+                };
+            };
+
+            /* Link 1: Playback (Pi -> XMOS -> speaker) = hw:X,1 */
+            simple-audio-card,dai-link@1 {
+                reg = <1>;
+                format = "i2s";
+                bitclock-master = <&link1_codec>;
+                frame-master = <&link1_codec>;
+
+                link1_cpu: cpu {
+                    sound-dai = <&i2s_clk_consumer>;
+                    dai-tdm-slot-num = <2>;
+                    dai-tdm-slot-width = <32>;
+                };
+
+                link1_codec: codec {
+                    sound-dai = <&respeaker_play>;
+                };
+            };
+        };
+    };
+};
