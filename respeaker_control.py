@@ -9,14 +9,18 @@ XMOS (0x42) - Mic processing: mute, speaker enable, VNR readback
 AIC3204 (0x18) - Playback volume: headphone & line-out gain
 
 Usage:
-    python3 respeaker_control.py status          # Show all status
-    python3 respeaker_control.py volume 70       # Set playback volume (0-100%)
-    python3 respeaker_control.py play file.wav    # Play with volume control applied
-    python3 respeaker_control.py mute            # Toggle mute button status
-    python3 respeaker_control.py speaker on      # Enable/disable speaker amp
-    python3 respeaker_control.py vnr             # Read Voice-to-Noise Ratio
+    python3 respeaker_control.py status              # Show all status + device info
+    python3 respeaker_control.py volume 70           # Set playback volume (0-100%)
+    python3 respeaker_control.py play file.wav       # Play with volume control applied
+    python3 respeaker_control.py mute                # Toggle mute button status
+    python3 respeaker_control.py speaker on          # Enable/disable speaker amp
+    python3 respeaker_control.py vnr                 # Read Voice-to-Noise Ratio
+    python3 respeaker_control.py devices             # Show discovered ALSA devices
+    python3 respeaker_control.py verify              # Verify card + .asoundrc match
+    python3 respeaker_control.py generate-asoundrc   # Regenerate .asoundrc from actual devices
 """
 
+import re
 import sys
 import time
 import subprocess
@@ -48,6 +52,45 @@ AIC_LOR_GAIN = 0x13     # Line-out Right driver gain
 ALSA_CARD = "ReSpeakerLite"
 ALSA_SOFTVOL_CTL = "ReSpeaker PV"
 ALSA_SOFTVOL_PCM = "respeaker"
+
+
+def find_devices():
+    """Discover ReSpeaker Lite ALSA card number and device numbers.
+
+    Parses `arecord -l` and `aplay -l` to find the actual card and device
+    numbers, which may differ across installations.
+
+    Returns a dict with card_num, card_name, capture_dev, playback_dev,
+    capture_pcm, playback_pcm — or None if the card is not found.
+    """
+    card_num = None
+    capture_dev = None
+    playback_dev = None
+
+    for cmd, target in [("arecord", "capture"), ("aplay", "playback")]:
+        result = subprocess.run([cmd, "-l"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if ALSA_CARD in line:
+                m = re.match(r'card\s+(\d+):.*device\s+(\d+):', line)
+                if m:
+                    card_num = int(m.group(1))
+                    if target == "capture":
+                        capture_dev = int(m.group(2))
+                    else:
+                        playback_dev = int(m.group(2))
+                break
+
+    if card_num is None:
+        return None
+
+    return {
+        "card_num": card_num,
+        "card_name": ALSA_CARD,
+        "capture_dev": capture_dev,
+        "playback_dev": playback_dev,
+        "capture_pcm": f"hw:{ALSA_CARD},{capture_dev}" if capture_dev is not None else None,
+        "playback_pcm": f"hw:{ALSA_CARD},{playback_dev}" if playback_dev is not None else None,
+    }
 
 
 class ReSpeakerControl:
@@ -131,7 +174,6 @@ class ReSpeakerControl:
         if result.returncode != 0:
             print(f"Error setting volume: {result.stderr.strip()}")
             return
-        import re
         m = re.search(r'\[([^\]]+dB)\]', result.stdout)
         db_str = m.group(1) if m else f"{percent}%"
         print(f"Volume: {percent}% ({db_str})")
@@ -145,7 +187,6 @@ class ReSpeakerControl:
         )
         if result.returncode != 0:
             return None, "softvol not available"
-        import re
         m = re.search(r'\[(\d+)%\]\s*\[([^\]]+)\]', result.stdout)
         if m:
             return int(m.group(1)), m.group(2)
@@ -188,6 +229,13 @@ class ReSpeakerControl:
         print(f"Mute button: {'muted' if self.get_mute_status() else 'not muted'}")
         pct, db_str = self.get_volume()
         print(f"Volume:      {pct}% ({db_str})")
+        devs = find_devices()
+        if devs:
+            print(f"Card:        {devs['card_name']} (hw:{devs['card_num']})")
+            print(f"Capture:     {devs['capture_pcm']}")
+            print(f"Playback:    {devs['playback_pcm']}")
+        else:
+            print("Card:        NOT FOUND")
 
 
 def main():
@@ -236,6 +284,98 @@ def main():
 
         elif cmd == "firmware":
             print(f"Firmware: {ctrl.get_firmware_version()}")
+
+        elif cmd == "devices":
+            devs = find_devices()
+            if devs is None:
+                print(f"Card '{ALSA_CARD}' not found. Is the overlay loaded?")
+                sys.exit(1)
+            print(f"Card:     {devs['card_name']} (hw:{devs['card_num']})")
+            print(f"Capture:  {devs['capture_pcm']}")
+            print(f"Playback: {devs['playback_pcm']}")
+            print(f"Softvol:  -D {ALSA_SOFTVOL_PCM}")
+
+        elif cmd == "verify":
+            devs = find_devices()
+            ok = True
+            if devs is None:
+                print(f"FAIL: Card '{ALSA_CARD}' not found")
+                sys.exit(1)
+            print(f"OK: Card {devs['card_name']} found (hw:{devs['card_num']})")
+            if devs['capture_dev'] is None:
+                print("FAIL: No capture device"); ok = False
+            else:
+                print(f"OK: Capture device {devs['capture_pcm']}")
+            if devs['playback_dev'] is None:
+                print("FAIL: No playback device"); ok = False
+            else:
+                print(f"OK: Playback device {devs['playback_pcm']}")
+            # Check .asoundrc matches actual devices
+            import os
+            asoundrc = os.path.expanduser("~/.asoundrc")
+            if os.path.exists(asoundrc):
+                with open(asoundrc) as f:
+                    cfg = f.read()
+                expected_playback = f"hw:{ALSA_CARD},{devs['playback_dev']}"
+                expected_capture_dev = str(devs['capture_dev'])
+                if expected_playback in cfg:
+                    print(f"OK: .asoundrc playback matches ({expected_playback})")
+                else:
+                    print(f"WARN: .asoundrc may not match playback device {expected_playback}")
+                    ok = False
+                if f"device {expected_capture_dev}" in cfg:
+                    print(f"OK: .asoundrc capture device matches ({expected_capture_dev})")
+                else:
+                    print(f"WARN: .asoundrc may not match capture device {expected_capture_dev}")
+                    ok = False
+            else:
+                print(f"WARN: {asoundrc} not found")
+                ok = False
+            if not ok:
+                print("\nRun 'respeaker_control.py generate-asoundrc' to regenerate .asoundrc")
+                sys.exit(1)
+            print("\nAll checks passed.")
+
+        elif cmd == "generate-asoundrc":
+            devs = find_devices()
+            if devs is None:
+                print(f"Card '{ALSA_CARD}' not found. Is the overlay loaded?")
+                sys.exit(1)
+            import os
+            asoundrc = os.path.expanduser("~/.asoundrc")
+            content = f"""# ReSpeaker Lite: software volume control wrapping the hardware device
+# Auto-generated by respeaker_control.py
+# Playback: aplay -D {ALSA_SOFTVOL_PCM} file.wav
+# Capture:  arecord -D respeaker_cap file.wav
+
+pcm.{ALSA_SOFTVOL_PCM} {{
+    type softvol
+    slave.pcm "hw:{devs['card_name']},{devs['playback_dev']}"
+    control {{
+        name "{ALSA_SOFTVOL_CTL}"
+        card {devs['card_name']}
+    }}
+    min_dB -33.0
+    max_dB 10.0
+    resolution 256
+}}
+
+pcm.respeaker_cap {{
+    type hw
+    card {devs['card_name']}
+    device {devs['capture_dev']}
+}}
+"""
+            if os.path.exists(asoundrc):
+                backup = f"{asoundrc}.bak"
+                import shutil
+                shutil.copy2(asoundrc, backup)
+                print(f"Backed up {asoundrc} to {backup}")
+            with open(asoundrc, 'w') as f:
+                f.write(content)
+            print(f"Generated {asoundrc}")
+            print(f"  Playback: hw:{devs['card_name']},{devs['playback_dev']}")
+            print(f"  Capture:  hw:{devs['card_name']},{devs['capture_dev']}")
 
         else:
             print(f"Unknown command: {cmd}")

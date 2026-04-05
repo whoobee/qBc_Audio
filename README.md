@@ -81,13 +81,16 @@ amixer -c ReSpeakerLite sset 'ReSpeaker PV' 50%
 
 | Command              | Description                              |
 |----------------------|------------------------------------------|
-| `status`             | Show firmware version, VNR, mute, volume |
+| `status`             | Show firmware version, VNR, mute, volume, devices |
 | `volume [0-100]`     | Get or set playback volume               |
 | `play <file.wav>`    | Play a WAV file through softvol          |
 | `speaker on\|off`    | Enable/disable speaker amplifier         |
 | `vnr`                | Read Voice-to-Noise Ratio (0–100)        |
 | `mute`               | Read mute button status                  |
 | `firmware`           | Read XMOS firmware version               |
+| `devices`            | Show discovered ALSA card and device numbers |
+| `verify`             | Verify card exists and .asoundrc matches |
+| `generate-asoundrc`  | Regenerate ~/.asoundrc from detected devices |
 
 ## ALSA Devices
 
@@ -101,6 +104,17 @@ amixer -c ReSpeakerLite sset 'ReSpeaker PV' 50%
 ## Volume Architecture
 
 Volume is handled entirely in software via ALSA's `softvol` plugin, which wraps the raw hardware playback device (`hw:ReSpeakerLite,1`). The softvol range is **-33 dB to +10 dB** with 256 steps of resolution. The XMOS chip resets the AIC3204 codec registers on each new audio stream, so hardware volume registers are unreliable — softvol avoids this problem.
+
+## Device Discovery
+
+The ALSA card number (e.g. `hw:2`) can vary between systems depending on what other audio devices are present. All configuration uses the card **name** (`ReSpeakerLite`) instead of the number, so it stays correct regardless.
+
+If the device numbers (capture=0, playback=1) ever change, run:
+
+```bash
+python3 respeaker_control.py verify           # check if .asoundrc matches
+python3 respeaker_control.py generate-asoundrc # regenerate from actual devices
+```
 
 ## Compatibility
 
