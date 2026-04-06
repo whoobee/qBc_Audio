@@ -13,3 +13,5 @@ venv/
 env/
 .env
 *.log
+resources/playback/
+resources/recordings/
