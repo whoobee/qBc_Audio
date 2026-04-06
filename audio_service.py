@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 """
-qBc_Audio WebSocket Service
+qBc_Audio MQTT Service
 
-Provides audio recording, playback, and wake word detection via WebSocket.
+Provides audio recording, playback, and wake word detection via MQTT.
 
-WebSocket API (JSON):
-    {"command": "record"}                        Start microphone recording
-    {"command": "stop_recording"}                Stop recording, save to file
-    {"command": "play", "file": "name.wav"}      Play audio file (relative to resources/playback or absolute)
-    {"command": "stop_playing"}                  Stop current playback
-    {"command": "clear_trigger"}                 Clear wake word trigger state
-    {"command": "get_state"}                     Get current service state
+MQTT topics:
+    Subscribe:
+        robot/audio/cmd      General commands (JSON):
+                             {"command": "record"}
+                             {"command": "stop_recording"}
+                             {"command": "stop_playing"}
+                             {"command": "clear_trigger"}
+        robot/audio/play     Play audio file:
+                             {"file": "name.wav"}
 
-Broadcasts to all clients:
-    {"event": "triggered", "model": "...", "score": 0.xx}
-    {"event": "state", "listening": bool, "recording": bool, "playing": bool, "triggered": bool}
-    {"event": "playback_finished"}
+    Publish:
+        robot/audio/wake_word       {"model": "...", "score": 0.xx}
+        robot/audio/state           (RETAIN) {"status":"online", "listening":bool, ...}
+        robot/audio/recording_ready {"file": "/path/to/voice_xxx.wav"}
+        robot/system/heartbeat/audio  keepalive (1 Hz)
 
 Usage:
-    python3 audio_service.py [--port 8766] [--host 0.0.0.0] [--threshold 0.5]
+    python3 audio_service.py [--mqtt-broker localhost] [--mqtt-port 1883] [--threshold 0.5]
 """
 
-import asyncio
 import argparse
 import json
 import logging
@@ -35,10 +37,10 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import websockets
+import paho.mqtt.client as mqtt
 from openwakeword.model import Model as WakeWordModel
 
-from respeaker_control import find_devices, ALSA_CARD, ALSA_SOFTVOL_PCM
+from respeaker_control import find_devices, ReSpeakerControl, ALSA_CARD, ALSA_SOFTVOL_PCM
 
 logger = logging.getLogger("qBc_Audio")
 
@@ -58,10 +60,36 @@ WAKE_CHUNK_SAMPLES = 1280  # 80 ms at 16 kHz — openwakeword frame size
 DEFAULT_WAKE_THRESHOLD = 0.5
 TRIGGER_DURATION = 2.0  # seconds
 
+# MQTT topics
+TOPIC_CMD = "robot/audio/cmd"
+TOPIC_PLAY = "robot/audio/play"
+TOPIC_WAKE_WORD = "robot/audio/wake_word"
+TOPIC_SPEECH_TEXT = "robot/audio/speech_text"
+TOPIC_STATE = "robot/audio/state"
+TOPIC_HEARTBEAT = "robot/system/heartbeat/audio"
+TOPIC_RECORDING_READY = "robot/audio/recording_ready"
+
+# Voice recording (auto-triggered by wake word)
+VOICE_REC_TIMEOUT = 10.0          # max seconds
+VOICE_SILENCE_THRESHOLD = 500     # int16 RMS level for silence
+VOICE_SILENCE_DURATION = 1.5      # seconds of silence to auto-stop
+VOICE_MIN_DURATION = 0.5          # minimum seconds before silence-stop
+
+# TTS voice effects (sox) — applied only to voice=True playback
+# Set to None to disable
+VOICE_EFFECTS = [
+    "highpass", "600",
+    "pitch", "800",              # higher pitch (cents) — cute robot
+    "tempo", "1.25",               # slightly faster
+    "tremolo", "60", "50",      # subtle warble
+    "echo", "0.8", "0.8", "4", "0.8",  # short echo
+    "overdrive", "3",                # prevent clipping
+]
+
 
 class AudioService:
-    def __init__(self, host="0.0.0.0", port=8766, wake_threshold=DEFAULT_WAKE_THRESHOLD):
-        self.host = host
+    def __init__(self, broker="localhost", port=1883, wake_threshold=DEFAULT_WAKE_THRESHOLD):
+        self.broker = broker
         self.port = port
         self.wake_threshold = wake_threshold
 
@@ -74,6 +102,13 @@ class AudioService:
         self.capture_pcm = devs["capture_pcm"]
         self.playback_pcm = ALSA_SOFTVOL_PCM
         logger.info("Capture: %s, Playback: -D %s", self.capture_pcm, self.playback_pcm)
+
+        # ReSpeaker hardware control (for volume)
+        try:
+            self._respeaker = ReSpeakerControl()
+        except Exception:
+            self._respeaker = None
+            logger.warning("ReSpeaker I2C control unavailable — volume control disabled")
 
         # State
         self._listening = False
@@ -91,6 +126,11 @@ class AudioService:
         # Recording buffer
         self._rec_frames = []
 
+        # Voice recording state
+        self._voice_recording = False
+        self._voice_rec_start = 0.0
+        self._voice_silence_start = 0.0
+
         # Playback
         self._play_proc = None
 
@@ -98,9 +138,20 @@ class AudioService:
         self._wake_model = None
         self._load_wake_model()
 
-        # WebSocket clients
-        self._clients = set()
-        self._loop = None
+        # MQTT client
+        self._client = mqtt.Client(
+            mqtt.CallbackAPIVersion.VERSION2,
+            client_id="qbc_audio",
+        )
+        self._client.on_connect = self._on_connect
+        self._client.on_disconnect = self._on_disconnect
+        self._client.on_message = self._on_message
+        self._client.will_set(
+            TOPIC_STATE,
+            json.dumps({"status": "offline"}),
+            qos=1, retain=True,
+        )
+        self.connected = False
 
     # ------------------------------------------------------------------
     # Wake word model
@@ -132,27 +183,68 @@ class AudioService:
                 "recording": self._recording,
                 "playing": self._playing,
                 "triggered": self._triggered,
+                "voice_recording": self._voice_recording,
             }
 
     # ------------------------------------------------------------------
-    # WebSocket broadcast helpers
+    # MQTT publish helpers
     # ------------------------------------------------------------------
 
-    def _broadcast(self, message):
-        if self._loop is None or not self._clients:
+    def _publish_state(self):
+        """Publish current state to robot/audio/state (retained)."""
+        state = {"status": "online", **self._get_state()}
+        self._client.publish(TOPIC_STATE, json.dumps(state), qos=1, retain=True)
+
+    # ------------------------------------------------------------------
+    # MQTT callbacks
+    # ------------------------------------------------------------------
+
+    def _on_connect(self, client, userdata, connect_flags, reason_code, properties):
+        if reason_code.is_failure:
+            logger.error("MQTT connection failed: %s", reason_code)
             return
-        data = json.dumps(message)
-        asyncio.run_coroutine_threadsafe(self._async_broadcast(data), self._loop)
+        self.connected = True
+        logger.info("Connected to MQTT broker %s:%d", self.broker, self.port)
+        client.subscribe([(TOPIC_CMD, 1), (TOPIC_PLAY, 1)])
+        self._publish_state()
 
-    async def _async_broadcast(self, data):
-        if self._clients:
-            await asyncio.gather(
-                *[c.send(data) for c in self._clients],
-                return_exceptions=True,
+    def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
+        self.connected = False
+        if reason_code.is_failure:
+            logger.warning("Disconnected from MQTT broker: %s", reason_code)
+
+    def _on_message(self, client, userdata, msg):
+        try:
+            data = json.loads(msg.payload)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("Invalid JSON on %s", msg.topic)
+            return
+
+        if msg.topic == TOPIC_PLAY:
+            resp = self.handle_play(
+                data.get("file"), volume=data.get("volume"), voice=data.get("voice", False),
             )
+        elif msg.topic == TOPIC_CMD:
+            cmd = data.get("command", "")
+            if cmd == "record":
+                resp = self.handle_record()
+            elif cmd == "stop_recording":
+                resp = self.handle_stop_recording()
+            elif cmd == "stop_playing":
+                resp = self.handle_stop_playing()
+            elif cmd == "clear_trigger":
+                resp = self.handle_clear_trigger()
+            elif cmd == "get_state":
+                self._publish_state()
+                return
+            else:
+                logger.warning("Unknown audio command: %s", cmd)
+                return
+        else:
+            return
 
-    def _broadcast_state(self):
-        self._broadcast({"event": "state", **self._get_state()})
+        if resp and resp.get("status") == "error":
+            logger.warning("Audio command error: %s", resp.get("message"))
 
     # ------------------------------------------------------------------
     # Audio capture (background thread)
@@ -205,10 +297,36 @@ class AudioService:
             with self._lock:
                 is_recording = self._recording
                 is_listening = self._listening
+                is_voice = self._voice_recording
 
             # Accumulate raw frames while recording
             if is_recording:
                 self._rec_frames.append(data)
+
+            # Voice recording: check silence and timeout
+            if is_voice:
+                samples_v = np.frombuffer(data, dtype=np.int32)
+                mono_v = (samples_v[0::2] >> 16).astype(np.int16)
+                rms = np.sqrt(np.mean(mono_v.astype(np.float32) ** 2))
+
+                now = time.monotonic()
+                elapsed = now - self._voice_rec_start
+
+                stop_voice = False
+                if rms < VOICE_SILENCE_THRESHOLD:
+                    if self._voice_silence_start == 0.0:
+                        self._voice_silence_start = now
+                    elif (now - self._voice_silence_start >= VOICE_SILENCE_DURATION
+                          and elapsed >= VOICE_MIN_DURATION):
+                        stop_voice = True
+                else:
+                    self._voice_silence_start = 0.0
+
+                if elapsed >= VOICE_REC_TIMEOUT:
+                    stop_voice = True
+
+                if stop_voice:
+                    self._finish_voice_recording()
 
             # Feed wake word model while listening
             if is_listening and self._wake_model is not None:
@@ -239,13 +357,68 @@ class AudioService:
             self._triggered = True
             self._trigger_time = time.monotonic()
 
-        logger.info("Wake word: %s (score=%.3f)", model_name, score)
-        self._broadcast({
-            "event": "triggered",
-            "model": model_name,
-            "score": round(score, 3),
-        })
-        self._broadcast_state()
+            # Auto-start voice recording
+            if not self._recording:
+                self._listening = False
+                self._recording = True
+                self._voice_recording = True
+                self._rec_frames = []
+                self._voice_rec_start = time.monotonic()
+                self._voice_silence_start = 0.0
+
+        logger.info("Wake word: %s (score=%.3f) — recording voice", model_name, score)
+        self._client.publish(
+            TOPIC_WAKE_WORD,
+            json.dumps({"model": model_name, "score": round(float(score), 3)}),
+            qos=1,
+        )
+        self._publish_state()
+
+    def _finish_voice_recording(self):
+        """Stop voice recording, save as 16-bit mono WAV, publish recording_ready."""
+        with self._lock:
+            if not self._voice_recording:
+                return
+            self._recording = False
+            self._voice_recording = False
+            self._voice_silence_start = 0.0
+            self._listening = self._wake_model is not None
+
+        # Reset wake word model state for clean next detection
+        if self._wake_model is not None:
+            self._wake_model.reset()
+
+        frames = self._rec_frames
+        self._rec_frames = []
+
+        if not frames:
+            logger.warning("Voice recording empty")
+            self._publish_state()
+            return
+
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filepath = RECORDINGS_DIR / f"voice_{timestamp}.wav"
+
+        # Convert S32_LE stereo → 16-bit mono (left channel)
+        raw = b"".join(frames)
+        samples = np.frombuffer(raw, dtype=np.int32)
+        mono = (samples[0::2] >> 16).astype(np.int16)
+
+        with wave.open(str(filepath), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(SAMPLE_RATE)
+            wf.writeframes(mono.tobytes())
+
+        duration = len(mono) / SAMPLE_RATE
+        logger.info("Voice recording saved: %s (%.1fs)", filepath, duration)
+        self._client.publish(
+            TOPIC_RECORDING_READY,
+            json.dumps({"file": str(filepath)}),
+            qos=1,
+        )
+        self._publish_state()
 
     # ------------------------------------------------------------------
     # Command handlers
@@ -259,7 +432,7 @@ class AudioService:
             self._recording = True
             self._rec_frames = []
 
-        self._broadcast_state()
+        self._publish_state()
         logger.info("Recording started")
         return {"status": "ok", "message": "Recording started"}
 
@@ -268,6 +441,8 @@ class AudioService:
             if not self._recording:
                 return {"status": "error", "message": "Not recording"}
             self._recording = False
+            self._voice_recording = False
+            self._voice_silence_start = 0.0
             self._listening = self._wake_model is not None
 
         RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
@@ -284,17 +459,24 @@ class AudioService:
             wf.setframerate(SAMPLE_RATE)
             wf.writeframes(raw)
 
-        self._broadcast_state()
+        self._publish_state()
         logger.info("Recording saved: %s", filepath)
         return {"status": "ok", "file": str(filepath)}
 
-    def handle_play(self, file_path=None):
+    def handle_play(self, file_path=None, volume=None, voice=False):
         with self._lock:
             if self._playing:
                 return {"status": "error", "message": "Already playing"}
 
         if file_path is None:
             return {"status": "error", "message": "No file specified"}
+
+        if volume is not None and self._respeaker is not None:
+            try:
+                self._respeaker.set_volume(int(volume))
+                logger.info("Volume set to %d%%", int(volume))
+            except Exception as e:
+                logger.warning("Failed to set volume: %s", e)
 
         # Resolve relative paths against the default playback directory
         if not os.path.isabs(file_path):
@@ -309,17 +491,43 @@ class AudioService:
         with self._lock:
             self._playing = True
 
-        thread = threading.Thread(target=self._playback_worker, args=(file_path,), daemon=True)
+        thread = threading.Thread(
+            target=self._playback_worker, args=(file_path, voice), daemon=True,
+        )
         thread.start()
 
-        self._broadcast_state()
-        logger.info("Playback: %s", file_path)
+        self._publish_state()
+        logger.info("Playback: %s (voice=%s)", file_path, voice)
         return {"status": "ok", "file": file_path}
 
-    def _playback_worker(self, file_path):
+    def _apply_voice_effects(self, file_path):
+        """Apply robot voice effects via sox. Returns path to processed file."""
+        if not VOICE_EFFECTS:
+            return file_path
+        effected = file_path + ".fx.wav"
         try:
+            result = subprocess.run(
+                ["sox", file_path, effected] + VOICE_EFFECTS,
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0 and os.path.isfile(effected):
+                return effected
+            logger.warning("Sox effects failed: %s", result.stderr)
+        except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+            logger.warning("Sox unavailable, playing without effects: %s", e)
+        return file_path
+
+    def _playback_worker(self, file_path, voice=False):
+        effected_path = None
+        try:
+            play_path = file_path
+            if voice:
+                play_path = self._apply_voice_effects(file_path)
+                if play_path != file_path:
+                    effected_path = play_path
+
             self._play_proc = subprocess.Popen(
-                ["aplay", "-D", self.playback_pcm, file_path],
+                ["aplay", "-D", self.playback_pcm, play_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
@@ -332,10 +540,15 @@ class AudioService:
             logger.error("Playback exception: %s", e)
         finally:
             self._play_proc = None
+            # Clean up temp effects file
+            if effected_path:
+                try:
+                    os.remove(effected_path)
+                except OSError:
+                    pass
             with self._lock:
                 self._playing = False
-            self._broadcast({"event": "playback_finished"})
-            self._broadcast_state()
+            self._publish_state()
 
     def handle_stop_playing(self):
         if self._play_proc is not None:
@@ -349,58 +562,15 @@ class AudioService:
             self._triggered = False
         if self._wake_model is not None:
             self._wake_model.reset()
-        self._broadcast_state()
+        self._publish_state()
         logger.info("Trigger cleared")
         return {"status": "ok", "message": "Trigger cleared"}
-
-    # ------------------------------------------------------------------
-    # WebSocket server
-    # ------------------------------------------------------------------
-
-    async def _ws_handler(self, websocket):
-        self._clients.add(websocket)
-        remote = websocket.remote_address
-        logger.info("Client connected: %s", remote)
-        try:
-            async for raw in websocket:
-                try:
-                    msg = json.loads(raw)
-                except json.JSONDecodeError:
-                    await websocket.send(json.dumps(
-                        {"status": "error", "message": "Invalid JSON"}
-                    ))
-                    continue
-
-                cmd = msg.get("command", "")
-
-                if cmd == "record":
-                    resp = self.handle_record()
-                elif cmd == "stop_recording":
-                    resp = self.handle_stop_recording()
-                elif cmd == "play":
-                    resp = self.handle_play(msg.get("file"))
-                elif cmd == "stop_playing":
-                    resp = self.handle_stop_playing()
-                elif cmd == "clear_trigger":
-                    resp = self.handle_clear_trigger()
-                elif cmd == "get_state":
-                    resp = {"status": "ok", **self._get_state()}
-                else:
-                    resp = {"status": "error", "message": f"Unknown command: {cmd}"}
-
-                await websocket.send(json.dumps(resp))
-        except websockets.ConnectionClosed:
-            pass
-        finally:
-            self._clients.discard(websocket)
-            logger.info("Client disconnected: %s", remote)
 
     # ------------------------------------------------------------------
     # Main entry point
     # ------------------------------------------------------------------
 
-    async def run(self):
-        self._loop = asyncio.get_running_loop()
+    def run(self):
         self._running = True
 
         # Start wake word listening if a model is loaded
@@ -408,30 +578,39 @@ class AudioService:
         self._capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._capture_thread.start()
 
-        # Graceful shutdown on SIGTERM / SIGINT
-        stop = self._loop.create_future()
-        for sig in (signal.SIGTERM, signal.SIGINT):
-            self._loop.add_signal_handler(sig, stop.set_result, None)
+        # Connect MQTT
+        self._client.connect(self.broker, self.port)
+        self._client.loop_start()
 
-        async with websockets.serve(self._ws_handler, self.host, self.port):
-            logger.info("qBc_Audio service on ws://%s:%d", self.host, self.port)
-            if self._wake_model:
-                logger.info("Wake word detection active")
-            else:
-                logger.info("Wake word detection disabled (no models)")
-            await stop
+        logger.info("qBc_Audio service on MQTT %s:%d", self.broker, self.port)
+        if self._wake_model:
+            logger.info("Wake word detection active")
+        else:
+            logger.info("Wake word detection disabled (no models)")
+
+        # Block until signal, publish heartbeat every second
+        stop = threading.Event()
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+
+        while not stop.is_set():
+            self._client.publish(TOPIC_HEARTBEAT, b"1", qos=0)
+            stop.wait(1.0)
 
         logger.info("Shutting down...")
         self._running = False
+        self._client.publish(TOPIC_STATE, json.dumps({"status": "offline"}), qos=1, retain=True)
+        self._client.loop_stop()
+        self._client.disconnect()
         if self._play_proc:
             self._play_proc.terminate()
         self._stop_capture()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="qBc_Audio WebSocket Service")
-    parser.add_argument("--host", default="0.0.0.0", help="Bind address")
-    parser.add_argument("--port", type=int, default=8766, help="WebSocket port")
+    parser = argparse.ArgumentParser(description="qBc_Audio MQTT Service")
+    parser.add_argument("--mqtt-broker", default="localhost", help="MQTT broker address")
+    parser.add_argument("--mqtt-port", type=int, default=1883, help="MQTT broker port")
     parser.add_argument(
         "--threshold", type=float, default=DEFAULT_WAKE_THRESHOLD,
         help="Wake word detection threshold (0.0-1.0)",
@@ -448,11 +627,11 @@ def main():
     )
 
     service = AudioService(
-        host=args.host,
-        port=args.port,
+        broker=args.mqtt_broker,
+        port=args.mqtt_port,
         wake_threshold=args.threshold,
     )
-    asyncio.run(service.run())
+    service.run()
 
 
 if __name__ == "__main__":
