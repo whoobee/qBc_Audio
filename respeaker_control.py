@@ -348,9 +348,14 @@ def main():
 # Playback: aplay -D {ALSA_SOFTVOL_PCM} file.wav
 # Capture:  arecord -D respeaker_cap file.wav
 
+pcm.respeaker_hw {{
+    type plug
+    slave.pcm "hw:{devs['card_name']},{devs['playback_dev']}"
+}}
+
 pcm.{ALSA_SOFTVOL_PCM} {{
     type softvol
-    slave.pcm "hw:{devs['card_name']},{devs['playback_dev']}"
+    slave.pcm "respeaker_hw"
     control {{
         name "{ALSA_SOFTVOL_CTL}"
         card {devs['card_name']}
