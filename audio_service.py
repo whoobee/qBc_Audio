@@ -559,12 +559,17 @@ class AudioService:
             except Exception as e:
                 logger.warning("Failed to set volume: %s", e)
 
-        # Resolve relative paths against the default playback directory
+        # Resolve relative paths against PLAYBACK_DIR and SOUNDS_DIR
         if not os.path.isabs(file_path):
-            resolved = (PLAYBACK_DIR / file_path).resolve()
-            if not str(resolved).startswith(str(PLAYBACK_DIR.resolve())):
-                return {"status": "error", "message": "Invalid file path"}
-            file_path = str(resolved)
+            resolved_playback = (PLAYBACK_DIR / file_path).resolve()
+            resolved_sounds = (SOUNDS_DIR / file_path).resolve()
+
+            if resolved_sounds.is_file() and str(resolved_sounds).startswith(str(SOUNDS_DIR.resolve())):
+                file_path = str(resolved_sounds)
+            else:
+                if not str(resolved_playback).startswith(str(PLAYBACK_DIR.resolve())):
+                    return {"status": "error", "message": "Invalid file path"}
+                file_path = str(resolved_playback)
 
         if not os.path.isfile(file_path):
             return {"status": "error", "message": f"File not found: {file_path}"}
