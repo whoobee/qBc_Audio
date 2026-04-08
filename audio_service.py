@@ -70,6 +70,8 @@ TOPIC_SPEECH_TEXT = "robot/audio/speech_text"
 TOPIC_STATE = "robot/audio/state"
 TOPIC_HEARTBEAT = "robot/system/heartbeat/audio"
 TOPIC_RECORDING_READY = "robot/audio/recording_ready"
+TOPIC_CURRENT_STATE = "robot/audio/current_state"
+TOPIC_ERROR_INFO = "robot/audio/error_info"
 
 # Voice recording (auto-triggered by wake word)
 VOICE_REC_TIMEOUT = 10.0          # max seconds
@@ -157,6 +159,7 @@ class AudioService:
             qos=1, retain=True,
         )
         self.connected = False
+        self._error_info = "E_OK"
 
     # ------------------------------------------------------------------
     # Wake word model
@@ -191,6 +194,52 @@ class AudioService:
                 "voice_recording": self._voice_recording,
             }
 
+    def _derive_current_state(self):
+        """Derive human-readable current state from internal flags."""
+        with self._lock:
+            if self._playing:
+                return "playing"
+            if self._voice_recording:
+                return "voice_recording"
+            if self._recording:
+                return "recording"
+            if self._triggered:
+                return "wake_word_triggered"
+            if self._listening:
+                return "listening"
+            return "idle"
+
+    def _set_error(self, error):
+        """Set and publish error info."""
+        self._error_info = error
+        if self.connected:
+            self._client.publish(TOPIC_ERROR_INFO, error, qos=1, retain=True)
+
+    # ------------------------------------------------------------------
+    # Current state / error helpers
+    # ------------------------------------------------------------------
+
+    def _derive_current_state(self):
+        """Derive human-readable current state from internal flags."""
+        with self._lock:
+            if self._playing:
+                return "playing"
+            if self._voice_recording:
+                return "voice_recording"
+            if self._recording:
+                return "recording"
+            if self._triggered:
+                return "wake_word_triggered"
+            if self._listening:
+                return "listening"
+            return "idle"
+
+    def _set_error(self, error):
+        """Set and publish error info."""
+        self._error_info = error
+        if self.connected:
+            self._client.publish(TOPIC_ERROR_INFO, error, qos=1, retain=True)
+
     # ------------------------------------------------------------------
     # MQTT publish helpers
     # ------------------------------------------------------------------
@@ -199,6 +248,10 @@ class AudioService:
         """Publish current state to robot/audio/state (retained)."""
         state = {"status": "online", **self._get_state()}
         self._client.publish(TOPIC_STATE, json.dumps(state), qos=1, retain=True)
+        self._client.publish(TOPIC_CURRENT_STATE, self._derive_current_state(), qos=1, retain=True)
+        self._client.publish(TOPIC_ERROR_INFO, self._error_info, qos=1, retain=True)
+        self._client.publish(TOPIC_CURRENT_STATE, self._derive_current_state(), qos=1, retain=True)
+        self._client.publish(TOPIC_ERROR_INFO, self._error_info, qos=1, retain=True)
 
     # ------------------------------------------------------------------
     # MQTT callbacks
@@ -547,6 +600,7 @@ class AudioService:
 
     def _playback_worker(self, file_path, voice=False):
         effected_path = None
+        playback_ok = True
         try:
             play_path = file_path
             if voice:
@@ -564,8 +618,12 @@ class AudioService:
                 err = self._play_proc.stderr.read().decode().strip()
                 if err:
                     logger.error("Playback error: %s", err)
+                    self._set_error("playback: " + err[:80])
+                    playback_ok = False
         except Exception as e:
             logger.error("Playback exception: %s", e)
+            self._set_error("playback: " + str(e)[:80])
+            playback_ok = False
         finally:
             self._play_proc = None
             # Clean up temp effects file
@@ -576,6 +634,8 @@ class AudioService:
                     pass
             with self._lock:
                 self._playing = False
+            if playback_ok:
+                self._set_error("E_OK")
             self._publish_state()
 
     def handle_stop_playing(self):
