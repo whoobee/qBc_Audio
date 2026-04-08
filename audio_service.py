@@ -40,14 +40,16 @@ import numpy as np
 import paho.mqtt.client as mqtt
 from openwakeword.model import Model as WakeWordModel
 
-from respeaker_control import find_devices, ReSpeakerControl, ALSA_CARD, ALSA_SOFTVOL_PCM
+from respeaker_control import find_devices, ensure_asoundrc, ReSpeakerControl, ALSA_CARD, ALSA_SOFTVOL_PCM
 
 logger = logging.getLogger("qBc_Audio")
 
 BASE_DIR = Path(__file__).parent
 RECORDINGS_DIR = BASE_DIR / "resources" / "recordings"
 PLAYBACK_DIR = BASE_DIR / "resources" / "playback"
+SOUNDS_DIR = BASE_DIR / "resources" / "sounds"
 WAKE_WORD_DIR = BASE_DIR / "resources" / "wake_word_model"
+WAKEWORD_ACK_SOUND = str(SOUNDS_DIR / "wakeword-ack.wav")
 
 # Audio capture settings (ReSpeaker Lite native format)
 SAMPLE_RATE = 16000
@@ -93,12 +95,15 @@ class AudioService:
         self.port = port
         self.wake_threshold = wake_threshold
 
-        # Discover ALSA devices
+        # Discover ALSA devices and ensure .asoundrc is up to date
         devs = find_devices()
         if devs is None:
             raise RuntimeError(
                 f"ALSA card '{ALSA_CARD}' not found. Is the overlay loaded?"
             )
+        if ensure_asoundrc(devs):
+            logger.info("Regenerated ~/.asoundrc for hw:%s,%s",
+                        devs["card_name"], devs["playback_dev"])
         self.capture_pcm = devs["capture_pcm"]
         self.playback_pcm = ALSA_SOFTVOL_PCM
         logger.info("Capture: %s, Playback: -D %s", self.capture_pcm, self.playback_pcm)
@@ -367,12 +372,35 @@ class AudioService:
                 self._voice_silence_start = 0.0
 
         logger.info("Wake word: %s (score=%.3f) — recording voice", model_name, score)
+
+        # Play acknowledgment sound immediately (non-blocking)
+        if os.path.isfile(WAKEWORD_ACK_SOUND):
+            threading.Thread(
+                target=self._play_ack_sound, daemon=True,
+            ).start()
+
         self._client.publish(
             TOPIC_WAKE_WORD,
             json.dumps({"model": model_name, "score": round(float(score), 3)}),
             qos=1,
         )
         self._publish_state()
+
+    def _play_ack_sound(self):
+        """Play the wake-word acknowledgment sound in the background.
+
+        Uses a short subprocess so it doesn't interfere with the main
+        playback state (_playing flag) or voice recording.
+        """
+        try:
+            subprocess.run(
+                ["aplay", "-D", self.playback_pcm, WAKEWORD_ACK_SOUND],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+        except Exception as e:
+            logger.debug("Ack sound failed: %s", e)
 
     def _finish_voice_recording(self):
         """Stop voice recording, save as 16-bit mono WAV, publish recording_ready."""
