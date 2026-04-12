@@ -72,6 +72,7 @@ TOPIC_HEARTBEAT = "robot/system/heartbeat/audio"
 TOPIC_RECORDING_READY = "robot/audio/recording_ready"
 TOPIC_CURRENT_STATE = "robot/audio/current_state"
 TOPIC_ERROR_INFO = "robot/audio/error_info"
+TOPIC_SETTINGS_AUDIO = "robot/settings/audio"
 
 # Voice recording (auto-triggered by wake word)
 VOICE_REC_TIMEOUT = 10.0          # max seconds
@@ -116,6 +117,9 @@ class AudioService:
         except Exception:
             self._respeaker = None
             logger.warning("ReSpeaker I2C control unavailable — volume control disabled")
+
+        # Volume settings (updated via MQTT)
+        self._global_volume = 100
 
         # State
         self._listening = False
@@ -263,7 +267,7 @@ class AudioService:
             return
         self.connected = True
         logger.info("Connected to MQTT broker %s:%d", self.broker, self.port)
-        client.subscribe([(TOPIC_CMD, 1), (TOPIC_PLAY, 1)])
+        client.subscribe([(TOPIC_CMD, 1), (TOPIC_PLAY, 1), (TOPIC_SETTINGS_AUDIO, 1)])
         self._publish_state()
 
     def _on_disconnect(self, client, userdata, disconnect_flags, reason_code, properties):
@@ -276,6 +280,11 @@ class AudioService:
             data = json.loads(msg.payload)
         except (json.JSONDecodeError, UnicodeDecodeError):
             logger.warning("Invalid JSON on %s", msg.topic)
+            return
+
+        if msg.topic == TOPIC_SETTINGS_AUDIO:
+            self._global_volume = max(0, min(100, int(data.get("global_volume", self._global_volume))))
+            logger.info("Global volume updated: %d%%", self._global_volume)
             return
 
         if msg.topic == TOPIC_PLAY:
@@ -553,9 +562,12 @@ class AudioService:
             return {"status": "error", "message": "No file specified"}
 
         if volume is not None and self._respeaker is not None:
+            # Apply global volume scaling
+            effective = round(int(volume) * self._global_volume / 100)
             try:
-                self._respeaker.set_volume(int(volume))
-                logger.info("Volume set to %d%%", int(volume))
+                self._respeaker.set_volume(effective)
+                logger.info("Volume set to %d%% (requested=%s, global=%d%%)",
+                            effective, volume, self._global_volume)
             except Exception as e:
                 logger.warning("Failed to set volume: %s", e)
 
