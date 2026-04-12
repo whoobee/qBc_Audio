@@ -472,6 +472,7 @@ class AudioService:
             self._recording = False
             self._voice_recording = False
             self._voice_silence_start = 0.0
+            self._triggered = False
             self._listening = self._wake_model is not None
 
         # Reset wake word model state for clean next detection
