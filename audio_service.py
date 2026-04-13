@@ -301,6 +301,8 @@ class AudioService:
                 resp = self.handle_stop_playing()
             elif cmd == "clear_trigger":
                 resp = self.handle_clear_trigger()
+            elif cmd == "trigger_wake_word":
+                resp = self.handle_trigger_wake_word()
             elif cmd == "get_state":
                 self._publish_state()
                 return
@@ -671,6 +673,16 @@ class AudioService:
         self._publish_state()
         logger.info("Trigger cleared")
         return {"status": "ok", "message": "Trigger cleared"}
+
+    def handle_trigger_wake_word(self):
+        """Simulate a wake word detection — starts voice recording."""
+        with self._lock:
+            if self._triggered or self._voice_recording:
+                return {"status": "error", "message": "Already triggered"}
+            if self._playing:
+                return {"status": "error", "message": "Playing audio"}
+        self._on_trigger("manual", 1.0)
+        return {"status": "ok", "message": "Wake word triggered"}
 
     # ------------------------------------------------------------------
     # Main entry point
